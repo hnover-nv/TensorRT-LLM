@@ -23,9 +23,11 @@ mtp_len is the per-request sequence length processed by replay: in MTP it
 equals num_draft_tokens + 1 target token, so --mtp-lengths 6 models 5 drafts
 + 1 target.
 
-Baseline kernel (--baseline flashinfer_pr3324):
-  Calls FlashInfer PR 3324's checkpointing_ssu kernel against the same replay
-  cache tensors as the replay kernel.
+Baseline kernels:
+  --baseline flashinfer_pr3324 calls FlashInfer PR 3324's checkpointing_ssu
+  kernel against the same replay cache tensors as the replay kernel.
+  --baseline legacy_replay calls the old replay_selective_state_update wrapper
+  with its historical default tuning.
 
 Timing methodology
 ==================
@@ -76,10 +78,11 @@ NVTX traces.  Future agents: prefer reading this JSON over re-running nsys.
 Key format mirrors collect.py's kernel_data.json convention:
   incremental/{batch}/{mtp}/{sd}/k{prev_k}/{sweep_parts}/tp{tp}
   flashinfer_pr3324/{batch}/{mtp}/{sd}/k{prev_k}/{sweep_parts}/tp{tp}
+  legacy_replay/{batch}/{mtp}/{sd}/k{prev_k}/{sweep_parts}/tp{tp}
 
   - <sd> is normalized: bf16 / fp16 / fp32 / int8 / int16 / fp8.
   - <sweep_parts> is e.g. "M16_W1_S3_SR0_RECT0" — flags concatenated by
-    underscore in canonical order. pS/R/CT appear only when explicitly swept.
+    underscore in canonical order.
   - All numeric values in microseconds (us).
 
 Per-record fields:
@@ -235,11 +238,15 @@ def _import_mamba_kernels_fast():
     sys.modules[f"{mamba_pkg}.mamba2_metadata"] = metadata_stub
     # 4. The actual kernels
     replay_mod = _load("replay_selective_state_update", "replay_selective_state_update.py")
+    legacy_replay_mod = _load(
+        "legacy_replay_selective_state_update", "legacy_replay_selective_state_update.py"
+    )
     conv1d_mod = _load("causal_conv1d_triton", "causal_conv1d_triton.py")
 
     return (
         replay_mod.replay_selective_state_update,
         replay_mod._resolve_tuning,
+        legacy_replay_mod.legacy_replay_selective_state_update,
         conv1d_mod.causal_conv1d_update,
     )
 
@@ -249,11 +256,15 @@ def _import_mamba_kernels_full():
     replay_mod = importlib.import_module(
         "tensorrt_llm._torch.modules.mamba.replay_selective_state_update"
     )
+    legacy_replay_mod = importlib.import_module(
+        "tensorrt_llm._torch.modules.mamba.legacy_replay_selective_state_update"
+    )
     from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import causal_conv1d_update
 
     return (
         replay_mod.replay_selective_state_update,
         replay_mod._resolve_tuning,
+        legacy_replay_mod.legacy_replay_selective_state_update,
         causal_conv1d_update,
     )
 
@@ -264,6 +275,7 @@ if "--full-import" in sys.argv:
     (
         replay_selective_state_update,
         resolve_replay_tuning,
+        legacy_replay_selective_state_update,
         causal_conv1d_update,
     ) = _import_mamba_kernels_full()
 else:
@@ -271,6 +283,7 @@ else:
         (
             replay_selective_state_update,
             resolve_replay_tuning,
+            legacy_replay_selective_state_update,
             causal_conv1d_update,
         ) = _import_mamba_kernels_fast()
     except Exception as e:  # noqa: BLE001 - exit loudly; don't hide a fast-import regression
@@ -823,6 +836,7 @@ def _build_tensors(
 _CUPTI_KEEP_KERNEL_SUBSTRINGS = (
     "_dynamic_precompute",
     "_persistent_main",
+    "_legacy_replay_",
     "selective_scan_update",
     "selective_state_update",
     "checkpointing_ssu",
@@ -904,17 +918,27 @@ def _resolve_effective_replay_mode(
     return table_mode
 
 
-def _kernels_per_iter_baseline(with_conv1d: bool) -> int:
-    """Expected kernels per iter for the FlashInfer PR3324 baseline.
+def _kernels_per_iter_baseline(baseline: str, with_conv1d: bool) -> int:
+    """Expected kernels per iter for the selected baseline.
 
-    The baseline runs a single state-update kernel; `--with-conv1d` prepends
-    one conv1d kernel.
+    FlashInfer runs a single state-update kernel. Legacy replay runs the old
+    precompute + main kernel pair. `--with-conv1d` prepends one conv1d kernel.
     """
-    return 2 if with_conv1d else 1
+    if baseline == "flashinfer_pr3324":
+        k = 1
+    elif baseline == "legacy_replay":
+        k = 2
+    else:
+        raise ValueError(f"unknown baseline {baseline!r}")
+    return k + (1 if with_conv1d else 0)
 
 
 def _is_flashinfer_pr3324_baseline(args) -> bool:
     return getattr(args, "baseline", None) == "flashinfer_pr3324"
+
+
+def _is_legacy_replay_baseline(args) -> bool:
+    return getattr(args, "baseline", None) == "legacy_replay"
 
 
 def _prepare_flashinfer_jit_workspace() -> None:
@@ -2780,6 +2804,7 @@ def _bench_config(
         xbc_input_work.copy_(xbc_input0)
 
     is_pr3324_baseline = _is_flashinfer_pr3324_baseline(args)
+    is_legacy_replay_baseline = _is_legacy_replay_baseline(args)
 
     # Silently skip the baseline row for any (baseline, state_dtype, SR)
     # combo it can't run.  Better than erroring on a partial sweep — our
@@ -2788,18 +2813,25 @@ def _bench_config(
     #     semantics. Skip int16 because PR3324 treats it as raw int16 state,
     #     without our per-channel state_scale path; skip bf16 because we do not
     #     use bf16 state.
+    #   * legacy_replay: old wrapper supports fp32/fp16/bf16 state only, and
+    #     its stochastic-rounding path was only intended for fp16.
     def _baseline_supports() -> bool:
         if baseline_fn is None:
             return False
-        assert is_pr3324_baseline, args.baseline
-        if state_dtype not in (
-            torch.float32,
-            torch.float16,
-            torch.int8,
-            torch.float8_e4m3fn,
-        ):
-            return False
-        return not (use_philox and state_dtype == torch.float32)
+        if is_pr3324_baseline:
+            if state_dtype not in (
+                torch.float32,
+                torch.float16,
+                torch.int8,
+                torch.float8_e4m3fn,
+            ):
+                return False
+            return not (use_philox and state_dtype == torch.float32)
+        if is_legacy_replay_baseline:
+            if state_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                return False
+            return not (use_philox and state_dtype != torch.float16)
+        raise AssertionError(args.baseline)
 
     if baseline_fn is not None and not _baseline_supports():
         if not warmup_only:
@@ -3054,7 +3086,7 @@ def _bench_config(
                 if nw_full is not None:
                     scenario_per_iter_nw = nw_full[args.warmup : args.warmup + eff_iters].tolist()
 
-        if baseline_fn is not None and is_pr3324_baseline:
+        if baseline_fn is not None:
             baseline_suffix_parts = [f"SR={int(use_philox)}"]
             hsort_list_for_tags = getattr(args, "hardcode_sort_list", [False])
             hsort_in_cell_list = "HSORT" in getattr(args, "_cell_list_keys", ())
@@ -3086,11 +3118,11 @@ def _bench_config(
                     baseline_seen_keys.add(baseline_key)
 
             base_tag = (
-                f"base_pr3324_b{batch}_mtp{mtp_len}_{scn['label']}_"
+                f"base_{args.baseline}_b{batch}_mtp{mtp_len}_{scn['label']}_"
                 f"s{state_dtype_name}_a{act_dtype_name}"
             )
 
-            def _run_pr3324_baseline():
+            def _run_baseline():
                 if with_conv1d:
                     x_call, B_call, C_call = _conv1d_split(
                         xbc_input_work,
@@ -3099,46 +3131,77 @@ def _bench_config(
                     )
                 else:
                     x_call, B_call, C_call = x, B, C
-                # PR3324 predates double-buffered old_x. The benchmark keeps
-                # cache_buf_idx at zero, so buffer 0 is the active baseline view.
-                baseline_fn(
-                    state_work,
-                    old_x_work[:, 0],
-                    old_B_work,
-                    old_dt_work,
-                    old_dA_cumsum_work,
-                    cache_buf_idx_work,
-                    prev_tokens,
-                    x=x_call,
-                    dt=dt,
-                    A=A,
-                    B=B_call,
-                    C=C_call,
-                    out=out_base,
-                    D=D,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_batch_indices,
-                    state_scale=state_scales_work,
-                    rand_seed=rand_seed,
-                    philox_rounds=args.philox_rounds,
-                    enable_pdl=with_conv1d and args.external_pdl,
-                )
+                if is_pr3324_baseline:
+                    # PR3324 predates double-buffered old_x. The benchmark keeps
+                    # cache_buf_idx at zero, so buffer 0 is the active baseline view.
+                    baseline_fn(
+                        state_work,
+                        old_x_work[:, 0],
+                        old_B_work,
+                        old_dt_work,
+                        old_dA_cumsum_work,
+                        cache_buf_idx_work,
+                        prev_tokens,
+                        x=x_call,
+                        dt=dt,
+                        A=A,
+                        B=B_call,
+                        C=C_call,
+                        out=out_base,
+                        D=D,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_batch_indices,
+                        state_scale=state_scales_work,
+                        rand_seed=rand_seed,
+                        philox_rounds=args.philox_rounds,
+                        enable_pdl=with_conv1d and args.external_pdl,
+                    )
+                elif is_legacy_replay_baseline:
+                    # Legacy replay used T-sized history tensors and has no
+                    # quantized-state scale path. Slice the current larger
+                    # replay buffers back to the historical T contract.
+                    baseline_fn(
+                        state_work,
+                        old_x_work[:, 0, :mtp_len],
+                        old_B_work[:, :, :mtp_len],
+                        old_dt_work[:, :, :, :mtp_len],
+                        old_dA_cumsum_work[:, :, :, :mtp_len],
+                        cache_buf_idx_work,
+                        prev_tokens,
+                        x=x_call,
+                        dt=dt,
+                        A=A,
+                        B=B_call,
+                        C=C_call,
+                        out=out_base,
+                        D=D,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_batch_indices,
+                        rand_seed=rand_seed,
+                        philox_rounds=args.philox_rounds,
+                        launch_with_pdl=with_conv1d and args.external_pdl,
+                        use_internal_pdl=args.internal_pdl,
+                    )
+                else:
+                    raise AssertionError(args.baseline)
 
             reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
             if warmup_only:
                 reset_fn()
                 if scenario_pre_iter is not None:
                     scenario_pre_iter(0)
-                _run_pr3324_baseline()
+                _run_baseline()
                 torch.cuda.synchronize()
             elif run_baseline:
+                expected_baseline_kernels = _kernels_per_iter_baseline(args.baseline, with_conv1d)
                 stats = _time_kernel(
                     args,
-                    _run_pr3324_baseline,
+                    _run_baseline,
                     reset_fn,
                     base_tag,
-                    expected_K=_kernels_per_iter_baseline(with_conv1d),
+                    expected_K=expected_baseline_kernels,
                     pre_iter_fn=scenario_pre_iter,
                     pre_iter_group_factory=scenario_pre_iter_group_factory,
                     iters_override=scenario_iters,
@@ -3154,7 +3217,7 @@ def _bench_config(
                         bool(args.l2_flush),
                         bool(args.external_pdl),
                         bool(use_philox),
-                        _kernels_per_iter_baseline(with_conv1d),
+                        expected_baseline_kernels,
                     ),
                 )
                 _submit_result_job(
@@ -3444,9 +3507,7 @@ def _bench_config(
             parts = []
 
             # Tuned wrapper knobs emit "auto" when unset, meaning the wrapper
-            # resolves them from _DEFAULT_TUNING per cell.  pS/R/CT are not
-            # tuning-table knobs today, so leave them out unless explicitly
-            # swept.
+            # resolves them from _DEFAULT_TUNING per cell.
             def _val(v):
                 return "auto" if v is None else v
 
@@ -3633,6 +3694,7 @@ def _build_json_key(kernel_name, batch, mtp_len, prev_k, state_dtype_name, sweep
 
       incremental/{batch}/{mtp}/{sd}/k{k}/{sweep_parts}/tp{tp}
       flashinfer_pr3324/{batch}/{mtp}/{sd}/k{k}/{sweep_parts}/tp{tp}
+      legacy_replay/{batch}/{mtp}/{sd}/k{k}/{sweep_parts}/tp{tp}
 
     Replay rows collapse to "incremental"; baseline rows keep their baseline
     name.
@@ -4148,7 +4210,7 @@ def _run_benchmark(args) -> None:
     #
     # Each entry in the JSON file is a dict of canonical knob keys → values,
     # using the same names that appear in the sweep_tag (Mw/Mnw, Ww/Wnw,
-    # Sw/Snw, pW, pS, H, R, CT, CPSw/CPSnw, LSw/LSnw, FL, WS, TMARL,
+    # Sw/Snw, pW, H, CPSw/CPSnw, LSw/LSnw, FL, WS, TMARL,
     # TMAWL, TMANL, TMAWS, SR, RECT, NWF, MODE). Optional diagnostic HSORT cells
     # are accepted for compatibility. Each cell may also use the tied forms
     # M / W / S / CPS / LS (single value applied to both write and nowrite
@@ -4210,6 +4272,8 @@ def _run_benchmark(args) -> None:
     if args.baseline == "flashinfer_pr3324":
         _prepare_flashinfer_jit_workspace()
         from flashinfer_checkpointing_ssu_pr3324 import checkpointing_ssu as baseline_fn
+    elif args.baseline == "legacy_replay":
+        baseline_fn = legacy_replay_selective_state_update
     else:
         baseline_fn = None
 
@@ -4468,7 +4532,8 @@ def _parse_args() -> argparse.Namespace:
         "--state-dtypes",
         default="fp32",
         help="Comma-separated state dtypes: fp16,bf16,fp32,int8,int16,fp8.  "
-        "FlashInfer PR3324 baseline supports fp32/fp16/int8/fp8 only.",
+        "FlashInfer PR3324 baseline supports fp32/fp16/int8/fp8 only; "
+        "legacy_replay supports fp32/fp16/bf16, with SR only for fp16.",
     )
     parser.add_argument(
         "--act-dtypes",
@@ -4613,7 +4678,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Path to a JSON list of cell dicts (one per cell to time).  "
         "Each dict has canonical knob keys → values: Mw, Mnw, Ww, Wnw, Sw, "
-        "Snw, pW, pS, H, R, CT, CPSw, CPSnw, LSw, LSnw, FL, WS, TMARL, "
+        "Snw, pW, H, CPSw, CPSnw, LSw, LSnw, FL, WS, TMARL, "
         "TMAWL, TMANL, TMAWS, SR, RECT, MODE; optional diagnostic HSORT is "
         "also accepted (tied forms M / W / S / CPS / LS are also accepted "
         "and auto-expanded). "
@@ -4635,10 +4700,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         nargs="?",
         const="flashinfer_pr3324",
-        choices=["flashinfer_pr3324"],
+        choices=["flashinfer_pr3324", "legacy_replay"],
         help="Baseline to benchmark alongside the replay kernel. "
         "'flashinfer_pr3324': FlashInfer PR 3324 checkpointing_ssu, "
         "benchmarked per prev_k for fp32/fp16/int8/fp8 state. "
+        "'legacy_replay': old replay_selective_state_update wrapper with "
+        "historical default tuning. "
         "Pass --baseline alone for flashinfer_pr3324. Default: no baseline.",
     )
     parser.add_argument(
